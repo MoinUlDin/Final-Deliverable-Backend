@@ -1,0 +1,37 @@
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Local env / secrets
+.env
+local_settings.py
+
+# DB & media
+db.sqlite3
+db.sqlite3-journal
+media/
+
+# Logs
+*.log
+
+# Test / typecheck caches
+.pytest_cache/
+.mypy_cache/
+
+# Editor files (common)
+.vscode/
+.idea/
+.DS_Store
+
+# Ignore Django migration .py files (but keep __init__.py)
+**/migrations/*.py
+!**/migrations/__init__.py
+
+# Ignore compiled migration artifacts
+**/migrations/*.pyc
+**/migrations/__pycache__/
