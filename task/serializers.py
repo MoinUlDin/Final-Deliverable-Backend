@@ -122,10 +122,10 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
         validate_password(value)
         return value
 
-class PendingUserSerializer(serializers.ModelSerializer):
+class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ["id", "username", "email", "first_name", 'employee_number', "last_name", "role", "date_joined"]        
+        fields = ["id", "username", 'picture', "email", "first_name", 'employee_number', "last_name", "role", "date_joined"]        
           
 
 class AdminApprovalSerializer(serializers.Serializer):

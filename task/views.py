@@ -20,7 +20,7 @@ from .serializers import (
     ChangePasswordSerializer,
     PasswordResetRequestSerializer,
     PasswordResetConfirmSerializer,
-    PendingUserSerializer, AdminApprovalSerializer
+    UserSerializer, AdminApprovalSerializer
 )
 
 User = get_user_model()
@@ -187,16 +187,30 @@ class PasswordResetConfirmView(APIView):
 
 class PendingRequests(APIView):
     permission_classes = [IsAuthenticated, RolePermission]
-    serializer_class = PendingUserSerializer
+    serializer_class = UserSerializer
     def get(self, request):
-        pending_users = User.objects.filter(is_approved=False, is_rejected=False)
-        rejected_users = User.objects.filter(is_rejected=True)
-        serializer = PendingUserSerializer(pending_users, many=True)
-        rejected = PendingUserSerializer(rejected_users, many=True)
+        users = User.objects.all().exclude(role=User.Roles.ADMIN)
+        pending_users = users.filter(is_approved=False, is_rejected=False)
+        rejected_users = users.filter(is_rejected=True)
+        active_users = users.filter(is_approved=True, is_active=True)
+        pending_serializer = UserSerializer(pending_users, many=True, context={"request": request})
+        rejected = UserSerializer(rejected_users, many=True, context={"request": request})
+        active = UserSerializer(active_users, many=True, context={"request": request})
+
+        manager_count = users.filter(role=User.Roles.MANAGER).count()
+        member_count = users.filter(role=User.Roles.MEMBER).count()
         data = {
-            "count": pending_users.count(),
-            "requests": serializer.data,
-            "rejected": rejected.data
+            'count': {
+                "total": users.count(),
+                "pending": pending_users.count(),
+                "active": active_users.count(),
+                "rejected": rejected_users.count(),
+                'manager': manager_count,
+                "member": member_count,
+                },
+            "pending": pending_serializer.data,
+            "rejected": rejected.data,
+            'active': active.data,
         }
         return Response(data)
 
