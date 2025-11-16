@@ -4,6 +4,10 @@ from django.contrib.auth.password_validation import validate_password
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from django.utils import timezone
+from django.db import transaction
+from .models import Task, Assignment, TaskFile
+
 User = get_user_model()
 
         
@@ -94,7 +98,6 @@ class LoginSerializer(TokenObtainPairSerializer):
             'is_active': user.is_active,
             'is_approved': bool(user.is_approved, ),
         }
-        print(f'\n Senind response with {user_info}')
         data['user_info'] = user_info
 
         return data
@@ -133,3 +136,42 @@ class AdminApprovalSerializer(serializers.Serializer):
     action = serializers.ChoiceField(choices=["approve", "reject"])
 
 
+class TaskSerializer(serializers.ModelSerializer):
+    # write-only list of user IDs to assign on create/update
+    assignees = serializers.ListField(
+        child=serializers.IntegerField(),
+        write_only=True,
+        required=False,
+        help_text="List of user IDs to assign to this task (members only)."
+    )
+    # files can also be provided in multipart as 'files' (handled in view)
+    files = serializers.ListField(child=serializers.FileField(), write_only=True, required=False)
+
+    created_by = serializers.SerializerMethodField(read_only=True)
+    assigned_users = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = Task
+        fields = [
+            "id", "title", "description", "priority", "status", "progress",
+            "due_date", "created_at", "updated_at", "completed_at",
+            "created_by", "assignees", "files", "assigned_users", "meta",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at", "completed_at", "created_by", "assigned_users"]
+
+    def get_created_by(self, obj):
+        if obj.created_by:
+            return {"id": obj.created_by.id, "username": obj.created_by.username, "first_name": obj.created_by.first_name}
+        return None
+
+    def get_assigned_users(self, obj):
+        # return simple list of user dicts
+        return [
+            {"id": a.user.id, "username": a.user.username, "first_name": a.user.first_name, "assigned_at": a.assigned_at}
+            for a in obj.assignments.select_related("user").all()
+        ]
+
+    def validate_progress(self, value):
+        if value < 0 or value > 100:
+            raise serializers.ValidationError("Progress must be between 0 and 100.")
+        return value

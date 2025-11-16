@@ -5,7 +5,8 @@ from django.contrib.auth.models import (
 from django.utils import timezone
 from django.core.mail import send_mail
 from django.utils.translation import gettext_lazy as _
-
+import uuid
+from django.core.validators import MinValueValidator, MaxValueValidator
 
 class CustomUserManager(BaseUserManager):
     use_in_migrations = True
@@ -88,3 +89,118 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
 
 
 
+class Task(models.Model):
+    class Priority(models.TextChoices):
+        LOW = "Low", "Low"
+        MEDIUM = "Medium", "Medium"
+        HIGH = "High", "High"
+
+    class Status(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        IN_PROGRESS = "IN_PROGRESS", "In Progress"
+        COMPLETED = "COMPLETED", "Completed"
+        CANCELLED = "CANCELLED", "Cancelled"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    priority = models.CharField(max_length=10, choices=Priority.choices, default=Priority.MEDIUM, db_index=True)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING, db_index=True)
+
+    progress = models.IntegerField(
+        default=0,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        db_index=True,
+        help_text="Integer progress percentage (0-100)."
+    )
+
+    due_date = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True, related_name="created_tasks")
+    is_notified = models.BooleanField(default=False)
+    meta = models.JSONField(null=True, blank=True)
+
+    def __str__(self):
+        return self.title
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["priority"]),
+            models.Index(fields=["due_date"]),
+            models.Index(fields=["progress"]),
+        ]
+
+
+class Assignment(models.Model):
+    id = models.AutoField(primary_key=True)
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="assignments")
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name="assignments")
+    assigned_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True, blank=True, related_name="assigned_tasks")
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("task", "user")
+        indexes = [models.Index(fields=["user"]), models.Index(fields=["task"])]
+
+    def __str__(self):
+        return f'User: {self.user.first_name} === Task: {self.task.title}'
+
+
+class Notification(models.Model):
+    class Types(models.TextChoices):
+        ASSIGNMENT = "Assignment", "Assignment"
+        DEADLINE = "Deadline Reminder", "Deadline Reminder"
+        UPDATE = "Update", "Update"
+        COMMENT = "Comment", "Comment"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    recipient = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name="notifications", db_index=True)
+    type = models.CharField(max_length=30, choices=Types.choices)
+    title= models.CharField(max_length=50)
+    message = models.TextField()
+    meta = models.JSONField(null=True, blank=True)
+    read = models.BooleanField(default=False, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f'User: {self.recipient.first_name} === Title: {self.title}'
+    class Meta:
+        indexes = [models.Index(fields=["recipient", "read"])]
+
+
+class NotificationState(models.Model):
+    """
+    Single-row state store for notification generation.
+    We'll use name='task_notifications' (unique) so it's easy to fetch.
+    """
+    name = models.CharField(max_length=64, unique=True)
+    last_calculation = models.DateField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.name}: {self.last_calculation}"
+
+
+class Comment(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="task_comments")
+    created_by = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name="user_comments")
+    text = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    edited_at = models.DateTimeField(null=True, blank=True)
+    parent = models.ForeignKey("self", on_delete=models.CASCADE, null=True, blank=True, related_name="replies")
+    is_deleted = models.BooleanField(default=False)
+    meta = models.JSONField(null=True, blank=True)
+
+
+class TaskFile(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="files")
+    uploaded_by = models.ForeignKey(CustomUser, on_delete=models.SET_NULL, null=True, blank=True, related_name="uploaded_files")
+    file = models.FileField(upload_to="task_files/")
+    file_name = models.CharField(max_length=512, blank=True)
+    file_size = models.BigIntegerField(null=True, blank=True)
+    content_type = models.CharField(max_length=100, blank=True, null=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True)

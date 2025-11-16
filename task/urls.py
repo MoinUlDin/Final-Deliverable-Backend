@@ -1,18 +1,13 @@
 # urls.py (app)
-from django.urls import path
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
 from .views import (
-    RegisterView, AdminApprovalView, LoginView,
-    ChangePasswordView, PasswordResetRequestView, PasswordResetConfirmView, PendingRequests
+    TaskViewSet
 )
 
+router = DefaultRouter()
+router.register('', TaskViewSet, basename='task')
 
 urlpatterns = [
-    path("auth/register/", RegisterView.as_view(), name="auth-register"),
-
-    path("auth/approve/", AdminApprovalView.as_view(), name="auth-approve"),
-    path("auth/login/", LoginView.as_view(), name="token_obtain_pair"),
-    path("auth/pending-requests/", PendingRequests.as_view(), name="pending-requests"),
-    path("auth/change-password/", ChangePasswordView.as_view(), name="change-password"),
-    path("auth/password-reset/", PasswordResetRequestView.as_view(), name="password-reset-request"),
-    path("auth/password-reset-confirm/", PasswordResetConfirmView.as_view(), name="password-reset-confirm"),
+    path("", include(router.urls)),
 ]

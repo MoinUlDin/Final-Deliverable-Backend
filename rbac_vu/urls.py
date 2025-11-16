@@ -7,9 +7,20 @@ from rest_framework_simplejwt.views import (
     TokenRefreshView,
     TokenVerifyView,
 )
+from task.views import (
+    RegisterView, AdminApprovalView, LoginView,
+    ChangePasswordView, PasswordResetRequestView, PasswordResetConfirmView, PendingRequests
+)
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView, SpectacularRedocView
 urlpatterns = [
      # JWT auth endpoints
+     path("auth/register/", RegisterView.as_view(), name="auth-register"),
+    path("auth/approve/", AdminApprovalView.as_view(), name="auth-approve"),
+    path("auth/login/", LoginView.as_view(), name="token_obtain_pair"),
+    path("auth/pending-requests/", PendingRequests.as_view(), name="pending-requests"),
+    path("auth/change-password/", ChangePasswordView.as_view(), name="change-password"),
+    path("auth/password-reset/", PasswordResetRequestView.as_view(), name="password-reset-request"),
+    path("auth/password-reset-confirm/", PasswordResetConfirmView.as_view(), name="password-reset-confirm"),
     path('api/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),   # returns access + refresh
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),  # rotates refresh if enabled
     path('api/token/verify/', TokenVerifyView.as_view(), name='token_verify'),

@@ -8,20 +8,31 @@ from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.conf import settings
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
+from rest_framework import viewsets, status, filters
+from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from .permissions import  RolePermission
+from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework_simplejwt.views import TokenObtainPairView
-from .permissions import IsAdminOrReadOnly
+from rest_framework.parsers import MultiPartParser, FormParser
+from django.db import transaction
+from rest_framework.exceptions import ValidationError, PermissionDenied
+
 from .serializers import (
     RegistrationSerializer,
-    LoginSerializer,
+    LoginSerializer, TaskSerializer,
     ChangePasswordSerializer,
     PasswordResetRequestSerializer,
     PasswordResetConfirmSerializer,
-    UserSerializer, AdminApprovalSerializer
+    UserSerializer, AdminApprovalSerializer,
 )
+from .models import (
+    Task, Notification, NotificationState, Comment, 
+    TaskFile, Assignment
+    )
+from .permissions import RolePermission, IsAdminOrReadOnly,TaskPermission
+
 
 User = get_user_model()
 token_generator = PasswordResetTokenGenerator()
@@ -214,5 +225,204 @@ class PendingRequests(APIView):
         }
         return Response(data)
 
+
+# ===========================================================================
+# ============================= Task View ===================================
+# ===========================================================================
+
+class TaskViewSet(viewsets.ModelViewSet):
+    """
+    Admin/Manager: create, update, delete tasks; assign users; upload files.
+    Member: list/retrieve tasks they are assigned to, and update progress (update_progress action).
+    """
+    queryset = Task.objects.all().order_by('-created_at')
+    serializer_class = TaskSerializer
+    parser_classes = [MultiPartParser, FormParser]
+    permission_classes = [IsAuthenticated, TaskPermission]
+
+    def get_queryset(self):
+        user = self.request.user
+        if getattr(user, "role", None) == user.Roles.MEMBER:
+            # Members only see tasks assigned to them
+            return Task.objects.filter(assignments__user=user).distinct().order_by('-created_at')
+        # Managers and Admins see all
+        return super().get_queryset()
+
+    def perform_create(self, serializer):
+        """
+        Handle assignees (list of IDs) and files in a single create call.
+        Expect assignees as either JSON array in body (assignees: [1,2]) or form data with multiple assignees.
+        Files are in request.FILES.getlist('files').
+        """
+        user = self.request.user
+        if getattr(user, "role", None) not in (user.Roles.MANAGER, user.Roles.ADMIN):
+            raise PermissionDenied("Only Managers or Admins can create tasks.")
+
+        assignees = self.request.data.getlist('assignees') if hasattr(self.request.data, "getlist") else self.request.data.get("assignees", [])
+        # when assignees come as JSON list from serializer validated_data, they will be present in serializer.validated_data
+        try:
+            data_assignees = serializer.validated_data.get("assignees", None)
+        except Exception:
+            data_assignees = None
+
+        if not assignees and data_assignees:
+            assignees = data_assignees
+
+        files = self.request.FILES.getlist('files')
+
+        with transaction.atomic():
+            task = serializer.save(created_by=user)
+
+            # handle assignees
+            if assignees:
+                for uid in assignees:
+                    try:
+                        uid_int = int(uid)
+                    except Exception:
+                        raise ValidationError({"assignees": f"Invalid user id: {uid}"})
+                    try:
+                        target = User.objects.get(pk=uid_int)
+                    except User.DoesNotExist:
+                        raise ValidationError({"assignees": f"User id {uid_int} not found."})
+
+                    # Only allow assigning to Members (as requested)
+                    if target.role != User.Roles.MEMBER:
+                        raise ValidationError({"assignees": f"User {target.username} is not a Member and cannot be assigned."})
+
+                    # create assignment if not exists
+                    Assignment.objects.get_or_create(task=task, user=target, defaults={"assigned_by": user})
+
+            # handle files
+            for f in files:
+                TaskFile.objects.create(
+                    task=task,
+                    uploaded_by=user,
+                    file=f,
+                    file_name=getattr(f, 'name', ''),
+                    file_size=getattr(f, 'size', None),
+                    content_type=getattr(f, 'content_type', None),
+                )
+
+    @action(detail=True, methods=['post'], url_path='assign', url_name='assign')
+    def assign(self, request, pk=None):
+        """
+        Assign members to an existing task (manager/admin action).
+        Body: { "assignees": [1,2,3] }
+        """
+        user = request.user
+        if getattr(user, "role", None) not in (user.Roles.MANAGER, user.Roles.ADMIN):
+            raise PermissionDenied("Only Managers or Admins can assign tasks.")
+
+        task = self.get_object()
+        assignees = request.data.get("assignees", [])
+        if not isinstance(assignees, (list, tuple)):
+            raise ValidationError({"assignees": "assignees must be a list of user ids."})
+
+        created = []
+        for uid in assignees:
+            try:
+                uid_int = int(uid)
+            except Exception:
+                raise ValidationError({"assignees": f"Invalid user id: {uid}"})
+            try:
+                target = User.objects.get(pk=uid_int)
+            except User.DoesNotExist:
+                raise ValidationError({"assignees": f"User id {uid_int} not found."})
+
+            if target.role != User.Roles.MEMBER:
+                raise ValidationError({"assignees": f"User {target.username} is not a Member and cannot be assigned."})
+
+            obj, created_flag = Assignment.objects.get_or_create(task=task, user=target, defaults={"assigned_by": user})
+            if created_flag:
+                created.append(target.id)
+
+        return Response({"detail": "Assigned processed.", "created": created})
+
+    @action(detail=True, methods=['post'], url_path='upload-files', url_name='upload_files', parser_classes=[MultiPartParser, FormParser])
+    def upload_files(self, request, pk=None):
+        """
+        Upload files to an existing task. Managers/Admins (or assigned Member?) can upload.
+        Body: multipart with files[].
+        """
+        task = self.get_object()
+        user = request.user
+
+        # who can upload? allow Manager/Admin, or Member if assigned
+        if user.role == user.Roles.MEMBER:
+            if not Assignment.objects.filter(task=task, user=user).exists():
+                raise PermissionDenied("Members can only upload files to tasks they're assigned to.")
+
+        files = request.FILES.getlist('files')
+        if not files:
+            raise ValidationError({"files": "No files provided."})
+
+        created = []
+        for f in files:
+            tf = TaskFile.objects.create(
+                task=task,
+                uploaded_by=user,
+                file=f,
+                file_name=getattr(f, 'name', ''),
+                file_size=getattr(f, 'size', None),
+                content_type=getattr(f, 'content_type', None),
+            )
+            created.append({"id": str(tf.id), "file_name": tf.file_name})
+
+        return Response({"detail": "Files uploaded.", "files": created})
+
+    @action(detail=True, methods=['patch'], url_path='update-progress', url_name='update_progress')
+    def update_progress(self, request, pk=None):
+        """
+        Members can update progress (0-100) on tasks they are assigned to.
+        Managers/Admins can also set progress.
+        Body: { "progress": 50 }
+        """
+        task = self.get_object()
+        user = request.user
+
+        if user.role == user.Roles.MEMBER:
+            # ensure member is assigned to the task
+            if not Assignment.objects.filter(task=task, user=user).exists():
+                raise PermissionDenied("You are not assigned to this task.")
+
+        progress = request.data.get("progress", None)
+        if progress is None:
+            raise ValidationError({"progress": "This field is required."})
+        try:
+            progress_int = int(progress)
+        except Exception:
+            raise ValidationError({"progress": "Must be an integer between 0 and 100."})
+        if progress_int < 0 or progress_int > 100:
+            raise ValidationError({"progress": "Must be between 0 and 100."})
+
+        task.progress = progress_int
+        # Optionally update status/completed_at when 100%
+        if progress_int == 100:
+            task.status = Task.Status.COMPLETED
+            task.completed_at = timezone.now()
+        else:
+            # If updating from 0 -> >0, set IN_PROGRESS
+            if task.status == Task.Status.PENDING and progress_int > 0:
+                task.status = Task.Status.IN_PROGRESS
+
+        task.save()
+        serializer = self.get_serializer(task)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['get'], url_path='my-tasks', url_name='my_tasks')
+    def my_tasks(self, request):
+        """
+        Convenience endpoint for members to list their assigned tasks.
+        """
+        user = request.user
+        if user.role != user.Roles.MEMBER:
+            return Response({"detail": "Only members use this endpoint."}, status=400)
+        qs = Task.objects.filter(assignments__user=user).distinct().order_by('-created_at')
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(qs, many=True)
+        return Response(serializer.data)
 
 

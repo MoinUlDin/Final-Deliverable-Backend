@@ -4,6 +4,7 @@ from .models import CustomUser
 from django import forms
 from django.contrib.auth.forms import ReadOnlyPasswordHashField
 from django.utils.translation import gettext_lazy as _
+from .models import Task, Assignment
 
 class CustomUserCreationForm(forms.ModelForm):
     password1 = forms.CharField(label=_("Password"), widget=forms.PasswordInput)
@@ -63,3 +64,5 @@ class CustomUserAdmin(BaseUserAdmin):
 
 
 admin.site.register(CustomUser, CustomUserAdmin)
+admin.site.register(Task)
+admin.site.register(Assignment)
