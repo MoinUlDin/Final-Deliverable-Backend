@@ -15,7 +15,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework_simplejwt.views import TokenObtainPairView
-from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
 from rest_framework.exceptions import ValidationError, PermissionDenied
 
@@ -237,7 +237,7 @@ class TaskViewSet(viewsets.ModelViewSet):
     """
     queryset = Task.objects.all().order_by('-created_at')
     serializer_class = TaskSerializer
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     permission_classes = [IsAuthenticated, TaskPermission]
 
     def get_queryset(self):

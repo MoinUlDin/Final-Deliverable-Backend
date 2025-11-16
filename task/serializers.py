@@ -147,6 +147,7 @@ class TaskSerializer(serializers.ModelSerializer):
     # files can also be provided in multipart as 'files' (handled in view)
     files = serializers.ListField(child=serializers.FileField(), write_only=True, required=False)
 
+    # read-only compact user info fields
     created_by = serializers.SerializerMethodField(read_only=True)
     assigned_users = serializers.SerializerMethodField(read_only=True)
 
@@ -159,17 +160,75 @@ class TaskSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "created_at", "updated_at", "completed_at", "created_by", "assigned_users"]
 
+    def _profile_picture_url(self, user):
+        """
+        Return absolute URL for user's picture when possible, otherwise None.
+        """
+        pic = getattr(user, "picture", None)
+        if not pic:
+            return None
+        try:
+            # prefer building absolute URI if request in context
+            request = self.context.get("request", None)
+            if request is not None:
+                return request.build_absolute_uri(pic.url)
+            return pic.url
+        except Exception:
+            # fallback to file URL or None
+            try:
+                return pic.url
+            except Exception:
+                return None
+
+    def _compact_user(self, user):
+        if not user:
+            return None
+        return {
+            "id": user.id,
+            "first_name": getattr(user, "first_name", ""),
+            "last_name": getattr(user, "last_name", ""),
+            "username": getattr(user, "username", ""),
+            "profile_picture": self._profile_picture_url(user),
+            "role": getattr(user, "role", None),
+            "email": getattr(user, "email", None),
+        }
+
     def get_created_by(self, obj):
-        if obj.created_by:
-            return {"id": obj.created_by.id, "username": obj.created_by.username, "first_name": obj.created_by.first_name}
-        return None
+        """
+        Return compact user info for created_by.
+        """
+        return self._compact_user(obj.created_by) if obj.created_by else None
 
     def get_assigned_users(self, obj):
-        # return simple list of user dicts
-        return [
-            {"id": a.user.id, "username": a.user.username, "first_name": a.user.first_name, "assigned_at": a.assigned_at}
-            for a in obj.assignments.select_related("user").all()
-        ]
+        """
+        Return a list of assignment entries. Each entry contains:
+        {
+          "assignee": {compact user},
+          "assigned_by": {compact user or null},
+          "assigned_at": "ISO datetime string" or null
+        }
+        """
+        result = []
+        # use select_related for assigned_by and user for efficiency
+        assignments = obj.assignments.select_related("user", "assigned_by").all()
+        for a in assignments:
+            assigned_by_user = a.assigned_by  # may be None
+            assignee_user = getattr(a, "user", None)
+            assigned_at = getattr(a, "assigned_at", None)
+            if assigned_at is not None:
+                try:
+                    assigned_at_iso = assigned_at.isoformat()
+                except Exception:
+                    assigned_at_iso = str(assigned_at)
+            else:
+                assigned_at_iso = None
+
+            result.append({
+                "assignee": self._compact_user(assignee_user),
+                "assigned_by": self._compact_user(assigned_by_user),
+                "assigned_at": assigned_at_iso,
+            })
+        return result
 
     def validate_progress(self, value):
         if value < 0 or value > 100:
