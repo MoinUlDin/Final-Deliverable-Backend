@@ -278,3 +278,4 @@ class TaskSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Progress must be between 0 and 100.")
         return value
 
+

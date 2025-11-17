@@ -425,4 +425,44 @@ class TaskViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(qs, many=True)
         return Response(serializer.data)
 
+class RemoveAttachedFile(APIView):
+    """
+    DELETE /task-files/{pk}/
+    Only users in allowed_roles (Admin, Manager) can remove an attached file.
+    This removes the DB record and deletes the actual file from storage. ID=File-Id
+    """
+    permission_classes = [IsAuthenticated, RolePermission]
+    allowed_roles = [User.Roles.ADMIN, User.Roles.MANAGER]
 
+    def delete(self, request, pk=None, *args, **kwargs):
+        if not pk:
+            return Response({"detail": "File id (pk) is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        task_file = get_object_or_404(TaskFile, pk=pk)
+
+        user = request.user
+        if getattr(user, "role", None) not in (User.Roles.ADMIN, User.Roles.MANAGER):
+            raise PermissionDenied("Only Admins or Managers may remove attached files.")
+
+        try:
+            with transaction.atomic():
+                # Delete the actual file from storage if present
+                try:
+                    if task_file.file and getattr(task_file.file, "name", None):
+                        # delete from storage backend; save=False prevents model save
+                        task_file.file.delete(save=False)
+                except Exception as exc:
+                    # If storage deletion fails, we log/continue to let DB record be removed or raise depending on preference.
+                    # Keeping it simple: raise to abort transaction and return error.
+                    return Response(
+                        {"detail": "Failed to delete file from storage.", "error": str(exc)},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
+
+                # Delete DB record
+                task_file.delete()
+
+        except Exception as exc:
+            return Response({"detail": "Failed to remove file.", "error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response({"detail": "File deleted."}, status=status.HTTP_200_OK)
