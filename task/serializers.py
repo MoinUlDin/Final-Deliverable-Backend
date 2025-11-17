@@ -135,7 +135,6 @@ class AdminApprovalSerializer(serializers.Serializer):
     user_id = serializers.IntegerField()
     action = serializers.ChoiceField(choices=["approve", "reject"])
 
-
 class TaskSerializer(serializers.ModelSerializer):
     # write-only list of user IDs to assign on create/update
     assignees = serializers.ListField(
@@ -151,30 +150,36 @@ class TaskSerializer(serializers.ModelSerializer):
     created_by = serializers.SerializerMethodField(read_only=True)
     assigned_users = serializers.SerializerMethodField(read_only=True)
 
+    # NEW: return attached files metadata & URL
+    attached_files = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = Task
         fields = [
             "id", "title", "description", "priority", "status", "progress",
             "due_date", "created_at", "updated_at", "completed_at",
-            "created_by", "assignees", "files", "assigned_users", "meta",
+            "created_by", "assignees", "files", "assigned_users", "attached_files", "meta",
         ]
-        read_only_fields = ["id", "created_at", "updated_at", "completed_at", "created_by", "assigned_users"]
+        read_only_fields = [
+            "id", "created_at", "updated_at", "completed_at",
+            "created_by", "assigned_users", "attached_files",
+        ]
 
     def _profile_picture_url(self, user):
         """
         Return absolute URL for user's picture when possible, otherwise None.
         """
+        if not user:
+            return None
         pic = getattr(user, "picture", None)
         if not pic:
             return None
         try:
-            # prefer building absolute URI if request in context
             request = self.context.get("request", None)
             if request is not None:
                 return request.build_absolute_uri(pic.url)
             return pic.url
         except Exception:
-            # fallback to file URL or None
             try:
                 return pic.url
             except Exception:
@@ -209,19 +214,12 @@ class TaskSerializer(serializers.ModelSerializer):
         }
         """
         result = []
-        # use select_related for assigned_by and user for efficiency
         assignments = obj.assignments.select_related("user", "assigned_by").all()
         for a in assignments:
             assigned_by_user = a.assigned_by  # may be None
             assignee_user = getattr(a, "user", None)
             assigned_at = getattr(a, "assigned_at", None)
-            if assigned_at is not None:
-                try:
-                    assigned_at_iso = assigned_at.isoformat()
-                except Exception:
-                    assigned_at_iso = str(assigned_at)
-            else:
-                assigned_at_iso = None
+            assigned_at_iso = assigned_at.isoformat() if assigned_at is not None else None
 
             result.append({
                 "assignee": self._compact_user(assignee_user),
@@ -230,7 +228,53 @@ class TaskSerializer(serializers.ModelSerializer):
             })
         return result
 
+    def get_attached_files(self, obj):
+        """
+        Return metadata for TaskFile objects related to this task.
+        Each file entry:
+        {
+          "id": str(uuid),
+          "file_name": "...",
+          "file_size": 12345,
+          "content_type": "application/pdf",
+          "uploaded_at": "ISO datetime",
+          "uploaded_by": {compact user or null},
+          "url": "absolute url to file"
+        }
+        """
+        files_qs = obj.files.select_related("uploaded_by").all()
+        request = self.context.get("request", None)
+        out = []
+        for f in files_qs:
+            # file url (absolute when request available)
+            file_url = None
+            try:
+                if getattr(f, "file", None):
+                    if request is not None:
+                        try:
+                            file_url = request.build_absolute_uri(f.file.url)
+                        except Exception:
+                            file_url = f.file.url
+                    else:
+                        file_url = f.file.url
+            except Exception:
+                file_url = None
+
+            uploaded_at_iso = f.uploaded_at.isoformat() if f.uploaded_at is not None else None
+
+            out.append({
+                "id": str(getattr(f, "id", None)),
+                "file_name": f.file_name or (getattr(f.file, "name", None) if getattr(f, "file", None) else None),
+                "file_size": f.file_size,
+                "content_type": f.content_type,
+                "uploaded_at": uploaded_at_iso,
+                "uploaded_by": self._compact_user(getattr(f, "uploaded_by", None)),
+                "url": file_url,
+            })
+        return out
+
     def validate_progress(self, value):
         if value < 0 or value > 100:
             raise serializers.ValidationError("Progress must be between 0 and 100.")
         return value
+
