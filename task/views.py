@@ -17,8 +17,8 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError, PermissionDenied
-
 from .serializers import (
     RegistrationSerializer,
     LoginSerializer, TaskSerializer,
@@ -269,7 +269,7 @@ class TaskViewSet(viewsets.ModelViewSet):
             assignees = data_assignees
 
         files = self.request.FILES.getlist('files')
-
+        
         with transaction.atomic():
             task = serializer.save(created_by=user)
 
@@ -303,6 +303,66 @@ class TaskViewSet(viewsets.ModelViewSet):
                     content_type=getattr(f, 'content_type', None),
                 )
 
+    def perform_update(self, serializer):
+        """
+        Update task and replace assignees if `assignees` is provided.
+        - Accepts assignees as repeated form fields (multipart) or JSON array.
+        - Does NOT handle files (files are handled on creation and via upload-files endpoint).
+        """
+        user = self.request.user
+        # Only Manager/Admin should update core fields & assignees.
+        if getattr(user, "role", None) not in (user.Roles.MANAGER, user.Roles.ADMIN):
+            raise PermissionDenied("Only Managers or Admins can update tasks.")
+
+        # Read assignees from request (multipart) or serializer.validated_data (JSON)
+        assignees = (
+            self.request.data.getlist("assignees")
+            if hasattr(self.request.data, "getlist")
+            else self.request.data.get("assignees", None)
+        )
+        try:
+            data_assignees = serializer.validated_data.get("assignees", None)
+        except Exception:
+            data_assignees = None
+
+        # If we didn't find repeated form fields, but serializer has assignees (JSON), use it.
+        # Note: assignees may be None (not provided) or [] (explicitly provided empty list)
+        if assignees is None and data_assignees is not None:
+            assignees = data_assignees
+
+        with transaction.atomic():
+            # perform the model update
+            task = serializer.save()
+
+            # If assignees is None => client didn't provide assignees -> leave current assignments unchanged.
+            # If assignees is provided (could be []), replace assignments with exactly these IDs.
+            if assignees is not None:
+                new_ids = []
+                for uid in assignees:
+                    try:
+                        uid_int = int(uid)
+                    except Exception:
+                        raise ValidationError({"assignees": f"Invalid user id: {uid}"})
+                    try:
+                        target = User.objects.get(pk=uid_int)
+                    except User.DoesNotExist:
+                        raise ValidationError({"assignees": f"User id {uid_int} not found."})
+                    if target.role != User.Roles.MEMBER:
+                        raise ValidationError({"assignees": f"User {target.username} is not a Member and cannot be assigned."})
+                    new_ids.append(uid_int)
+
+                current_ids = list(Assignment.objects.filter(task=task).values_list("user_id", flat=True))
+
+                to_remove = set(current_ids) - set(new_ids)
+                to_add = set(new_ids) - set(current_ids)
+
+                if to_remove:
+                    Assignment.objects.filter(task=task, user_id__in=to_remove).delete()
+
+                for uid in to_add:
+                    # use get_or_create to avoid duplicates/races
+                    Assignment.objects.get_or_create(task=task, user_id=uid, defaults={"assigned_by": user})         
+                    
     @action(detail=True, methods=['post'], url_path='assign', url_name='assign')
     def assign(self, request, pk=None):
         """
@@ -389,6 +449,7 @@ class TaskViewSet(viewsets.ModelViewSet):
         if progress is None:
             raise ValidationError({"progress": "This field is required."})
         try:
+            print(f"\n we got progress: {progress} and Type: {type(progress)} \n")
             progress_int = int(progress)
         except Exception:
             raise ValidationError({"progress": "Must be an integer between 0 and 100."})
@@ -397,6 +458,8 @@ class TaskViewSet(viewsets.ModelViewSet):
 
         task.progress = progress_int
         # Optionally update status/completed_at when 100%
+        if progress_int < 100 and task.status == Task.Status.COMPLETED:
+            return Response ({'detail': 'Task is already Completed, you can update now.'}, status=status.HTTP_400_BAD_REQUEST)
         if progress_int == 100:
             task.status = Task.Status.COMPLETED
             task.completed_at = timezone.now()
@@ -424,6 +487,7 @@ class TaskViewSet(viewsets.ModelViewSet):
             return self.get_paginated_response(serializer.data)
         serializer = self.get_serializer(qs, many=True)
         return Response(serializer.data)
+
 
 class RemoveAttachedFile(APIView):
     """
