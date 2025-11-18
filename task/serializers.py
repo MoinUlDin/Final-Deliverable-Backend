@@ -130,7 +130,6 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = ["id", "username", 'picture', "email", "first_name", 'employee_number', "last_name", "role", "date_joined"]        
           
-
 class AdminApprovalSerializer(serializers.Serializer):
     user_id = serializers.IntegerField()
     action = serializers.ChoiceField(choices=["approve", "reject"])
@@ -164,7 +163,19 @@ class TaskSerializer(serializers.ModelSerializer):
             "id", "created_at", "updated_at", "completed_at",
             "created_by", "assigned_users", "attached_files",
         ]
+    def create(self, validated_data):
+        # Remove non-model keys so Model.objects.create() won't receive them.
+        # We keep a copy if needed, but view already read serializer.validated_data before calling save().
+        validated_data.pop("assignees", None)
+        validated_data.pop("files", None)
+        return super().create(validated_data)
 
+    def update(self, instance, validated_data):
+        # Remove non-model keys so Model.objects.update() won't receive them.
+        validated_data.pop("assignees", None)
+        validated_data.pop("files", None)
+        return super().update(instance, validated_data)
+    
     def _profile_picture_url(self, user):
         """
         Return absolute URL for user's picture when possible, otherwise None.
@@ -193,6 +204,7 @@ class TaskSerializer(serializers.ModelSerializer):
             "first_name": getattr(user, "first_name", ""),
             "last_name": getattr(user, "last_name", ""),
             "username": getattr(user, "username", ""),
+            "employee_number": getattr(user, "employee_number", ""),
             "profile_picture": self._profile_picture_url(user),
             "role": getattr(user, "role", None),
             "email": getattr(user, "email", None),

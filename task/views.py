@@ -247,7 +247,7 @@ class TaskViewSet(viewsets.ModelViewSet):
             return Task.objects.filter(assignments__user=user).distinct().order_by('-created_at')
         # Managers and Admins see all
         return super().get_queryset()
-
+    
     def perform_create(self, serializer):
         """
         Handle assignees (list of IDs) and files in a single create call.
@@ -466,3 +466,22 @@ class RemoveAttachedFile(APIView):
             return Response({"detail": "Failed to remove file.", "error": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         return Response({"detail": "File deleted."}, status=status.HTTP_200_OK)
+
+class ListMembers(APIView):
+    permission_classes = [IsAuthenticated, RolePermission]
+    allowed_roles = [User.Roles.ADMIN, User.Roles.MANAGER]
+
+    def get(self, request, *args, **kwargs):
+        member_qs = User.objects.filter(
+            role=User.Roles.MEMBER,
+            is_active=True,
+            is_approved=True
+        ).order_by("first_name", "last_name")
+
+        serializer = UserSerializer(member_qs, many=True, context={"request": request})
+
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+
+
