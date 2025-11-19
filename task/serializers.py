@@ -6,7 +6,7 @@ from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.utils import timezone
 from django.db import transaction
-from .models import Task, Assignment, TaskFile
+from .models import Task, Assignment, TaskFile, Notification
 
 User = get_user_model()
 
@@ -94,7 +94,7 @@ class LoginSerializer(TokenObtainPairSerializer):
             'role': user.role,
             'department': user.department,
             'employee_number': user.employee_number,
-            'picture': picture_url if getattr(user, 'picture', None) else None,
+            'profile_picture': picture_url if getattr(user, 'picture', None) else None,
             'is_active': user.is_active,
             'is_approved': bool(user.is_approved, ),
         }
@@ -133,6 +133,14 @@ class UserSerializer(serializers.ModelSerializer):
 class AdminApprovalSerializer(serializers.Serializer):
     user_id = serializers.IntegerField()
     action = serializers.ChoiceField(choices=["approve", "reject"])
+
+class CompactTaskSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Task
+        fields = [
+            "id", "title", "description", "priority", "status", "progress",
+            "due_date", "created_at", "updated_at", "completed_at",
+        ]
 
 class TaskSerializer(serializers.ModelSerializer):
     # write-only list of user IDs to assign on create/update
@@ -289,5 +297,29 @@ class TaskSerializer(serializers.ModelSerializer):
         if value < 0 or value > 100:
             raise serializers.ValidationError("Progress must be between 0 and 100.")
         return value
+
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    """
+    Notification serializer.
+    recipient is required (primary-key). The `read` flag may be toggled by the client.
+    """
+    recipient = serializers.PrimaryKeyRelatedField(queryset=User.objects.all())
+
+    class Meta:
+        model = Notification
+        fields = [
+            "id",
+            "recipient",
+            "type",
+            "title",
+            "message",
+            "meta",
+            "read",
+            "created_at",
+        ]
+        read_only_fields = ["id", "created_at"]
+
 
 

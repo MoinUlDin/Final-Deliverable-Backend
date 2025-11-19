@@ -8,7 +8,7 @@ from rest_framework_simplejwt.views import (
     TokenVerifyView,
 )
 from task.views import (
-    RegisterView, AdminApprovalView, LoginView,
+    RegisterView, AdminApprovalView, LoginView, MemberDashboardView,
     ChangePasswordView, PasswordResetRequestView, PasswordResetConfirmView, PendingRequests
 )
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView, SpectacularRedocView
@@ -25,6 +25,10 @@ urlpatterns = [
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),  # rotates refresh if enabled
     path('api/token/verify/', TokenVerifyView.as_view(), name='token_verify'),
 
+    # Dashboard
+    path('dashbord/member/<user_id>/', MemberDashboardView.as_view(), name='dashboard-member'),
+    
+    
     # drf-spectacular OpenAPI schema + UIs
     path('', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),

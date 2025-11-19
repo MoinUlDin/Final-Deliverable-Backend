@@ -7,9 +7,9 @@ from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.conf import settings
 from drf_spectacular.utils import extend_schema
-from rest_framework import status
-from rest_framework import viewsets, status, filters
+from rest_framework import viewsets, status, mixins
 from rest_framework.decorators import action
+from django.db.models import Avg, F
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -18,11 +18,12 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
 from django.utils import timezone
+from datetime import timedelta
 from rest_framework.exceptions import ValidationError, PermissionDenied
 from .serializers import (
-    RegistrationSerializer,
-    LoginSerializer, TaskSerializer,
-    ChangePasswordSerializer,
+    RegistrationSerializer, CompactTaskSerializer,
+    LoginSerializer, TaskSerializer, 
+    ChangePasswordSerializer, NotificationSerializer,
     PasswordResetRequestSerializer,
     PasswordResetConfirmSerializer,
     UserSerializer, AdminApprovalSerializer,
@@ -547,5 +548,166 @@ class ListMembers(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
+class MemberDashboardView(APIView):
+    permission_classes = [IsAuthenticated, RolePermission]
+    allowed_roles = [User.Roles.ADMIN, User.Roles.MANAGER, User.Roles.MEMBER]
+
+    def _compact_user(self, user, request):
+        return UserSerializer(user, context={"request": request}).data
+
+    def _compact_task_dict(self, task, member, over_due=False, dead_line=False ):
+        # include assignment metadata for this member (assigned_at)
+        assignment = Assignment.objects.filter(task=task, user=member).order_by('-assigned_at').first()
+        return {
+            "id": str(task.id),
+            "title": task.title,
+            "status": task.status,
+            "over_due": over_due,
+            "dead_line": dead_line,
+            "progress": getattr(task, "progress", 0),
+            "due_date": task.due_date.isoformat() if task.due_date else None,
+            "assigned_at": assignment.assigned_at.isoformat() if assignment and assignment.assigned_at else None,
+        }
+
+    def get(self, request, *args, **kwargs):
+        # determine target user (members can only see self)
+        query_user_id = request.query_params.get("user_id")
+        if request.user.role == User.Roles.MEMBER:
+            if query_user_id and str(query_user_id) != str(request.user.id):
+                return Response({"detail": "Members can only view their own dashboard."}, status=status.HTTP_403_FORBIDDEN)
+            target_user = request.user
+        else:
+            target_user = get_object_or_404(User, pk=query_user_id) if query_user_id else request.user
+
+        now = timezone.now()
+        window = now + timedelta(days=3)   # "next 2 or 3 days" — using 3 days
+
+        base_qs = Task.objects.filter(assignments__user=target_user).distinct()
+
+        total = base_qs.count()
+        completed = base_qs.filter(status=Task.Status.COMPLETED).count()
+        in_progress = base_qs.filter(status=Task.Status.IN_PROGRESS).count()
+        overdue = base_qs.filter(due_date__lt=now).exclude(status=Task.Status.COMPLETED).count()
+
+        # performance
+        avg_progress_val = base_qs.aggregate(avg=Avg('progress'))['avg'] or 0
+        try:
+            average_progress = int(round(avg_progress_val))
+        except Exception:
+            average_progress = int(avg_progress_val or 0)
+
+        on_time_rate = None
+        if completed > 0:
+            on_time_count = base_qs.filter(
+                status=Task.Status.COMPLETED,
+                completed_at__isnull=False,
+                due_date__isnull=False,
+            ).filter(completed_at__lte=F('due_date')).count()
+            on_time_rate = int(round((on_time_count / completed) * 100))
+
+        # Prepare the prioritized 5 tasks
+        desired = 5
+        selected = []
+        selected_ids = set()
+
+        # 1) one overdue (if any) - earliest due first
+        overdue_qs = base_qs.filter(due_date__lt=now).exclude(status=Task.Status.COMPLETED).order_by('due_date')
+        if overdue_qs.exists():
+            t = overdue_qs.first()
+            selected.append(self._compact_task_dict(t, target_user, over_due=True))
+            selected_ids.add(t.id)
+
+        # 2) up to 3 deadline-approaching (next 3 days), excluding already picked
+        deadline_qs = base_qs.filter(due_date__gte=now, due_date__lte=window).exclude(status=Task.Status.COMPLETED).exclude(id__in=selected_ids).order_by('due_date')
+        for t in deadline_qs[:3]:
+            if len(selected) >= desired:
+                break
+            selected.append(self._compact_task_dict(t, target_user, dead_line=True))
+            selected_ids.add(t.id)
+
+        # 3) recent completed tasks to fill remaining slots
+        if len(selected) < desired:
+            completed_qs = base_qs.filter(status=Task.Status.COMPLETED).exclude(id__in=selected_ids).order_by('-completed_at')
+            for t in completed_qs:
+                if len(selected) >= desired:
+                    break
+                selected.append(self._compact_task_dict(t, target_user))
+                selected_ids.add(t.id)
 
 
+        data = {
+            "user": self._compact_user(target_user, request),
+            "counts": {
+                "total": total,
+                "in_progress": in_progress,
+                "completed": completed,
+                "overdue": overdue,
+            },
+            "performance": {
+                "average_progress": average_progress,
+                "on_time_completion_rate": on_time_rate,
+            },
+            "top_tasks": selected,   # up to 5 tasks following your prioritization
+        }
+
+        return Response(data, status=status.HTTP_200_OK)
+
+
+
+# Notifications
+class NotificationViewSet(mixins.ListModelMixin,
+                          mixins.DestroyModelMixin,
+                          viewsets.GenericViewSet):
+    """
+    Notifications API:
+      - list (GET) -> user's notifications
+      - destroy (DELETE) -> delete a single notification (recipient only)
+      - mark-read (POST detail) -> mark a single notification as read (recipient only)
+      - mark-all-read (POST list) -> mark all unread notifications for the current user as read
+    Creation / update via API is NOT allowed (notifications are generated by the application).
+    """
+    serializer_class = NotificationSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        # Only return notifications that belong to the requesting user
+        return Notification.objects.filter(recipient=self.request.user).order_by("-created_at")
+
+    # disable create/update endpoints explicitly to make intent clear
+    def create(self, request, *args, **kwargs):
+        return Response({"detail": 'Method "POST" not allowed.'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def update(self, request, *args, **kwargs):
+        return Response({"detail": 'Method "PUT" not allowed.'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def partial_update(self, request, *args, **kwargs):
+        return Response({"detail": 'Method "PATCH" not allowed.'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def destroy(self, request, *args, **kwargs):
+        notif = self.get_object()
+        if notif.recipient != request.user:
+            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"], url_path="mark-read")
+    def mark_read(self, request, pk=None):
+        """
+        Mark a single notification as read. Only the recipient may do this.
+        """
+        notif = self.get_object()
+        if notif.recipient != request.user:
+            return Response({"detail": "Not allowed."}, status=status.HTTP_403_FORBIDDEN)
+        if not notif.read:
+            notif.read = True
+            notif.save(update_fields=["read"])
+        return Response({"status": "ok", "id": str(notif.id), "read": True})
+
+    @action(detail=False, methods=["post"], url_path="mark-all-read")
+    def mark_all_read(self, request):
+        """
+        Mark all unread notifications for the current user as read.
+        Returns number of notifications updated.
+        """
+        qs = Notification.objects.filter(recipient=request.user, read=False)
+        updated = qs.update(read=True)
+        return Response({"status": "ok", "updated": updated})

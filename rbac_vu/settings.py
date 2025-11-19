@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import timedelta
 from dotenv import load_dotenv
 import os
+import sys
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -35,9 +36,10 @@ INSTALLED_APPS = [
 
     'corsheaders',
     'rest_framework',
-    'task',
+    'task.apps.TaskConfig',
     'drf_spectacular',
     'rest_framework_simplejwt.token_blacklist',
+    "django_apscheduler",
 ]
 
 MIDDLEWARE = [
@@ -208,3 +210,17 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # User-uploaded files (images, attachments)
 MEDIA_URL = "/user_pictures/"
 MEDIA_ROOT = BASE_DIR
+
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "stream": sys.stdout},
+    },
+    "root": {"handlers": ["console"], "level": "INFO"},
+    "loggers": {
+        "task": {"handlers": ["console"], "level": "DEBUG", "propagate": False},
+        # optionally set for django_apscheduler etc.
+    },
+}
