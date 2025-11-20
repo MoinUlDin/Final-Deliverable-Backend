@@ -1,12 +1,13 @@
 # task/utils.py
 import logging
-from typing import Any, Dict, Optional, Tuple, Union, Iterable
+from typing import Any, Dict, Optional, Tuple, Union
 
 from django.db import transaction
+from django.core.exceptions import ObjectDoesNotExist
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 
-from .models import Notification, Task, Assignment, NotificationState 
+from .models import Notification, Task, Assignment 
 from datetime import timedelta
 
 
@@ -38,7 +39,63 @@ def format_datetime_friendly(dt) -> Optional[str]:
 
     return f"{date_part} ~ {time_part}"
 
-# Helper Function
+# Helper Functions for Notifications
+def single_notification(
+    recipient: Union[User, int, str], # pyright: ignore[reportInvalidTypeForm]
+    title: str,
+    message: str,
+    type: str = "",
+    meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, int]:
+    """
+    Create a single notification for `recipient` which may be a User instance or a PK.
+    Returns (success: bool, created_count: int)
+    """
+    try:
+        meta_value = meta or {}
+
+        # resolve recipient to User instance if necessary
+        if not isinstance(recipient, User):
+            try:
+                recipient_user = User.objects.get(pk=int(recipient))
+            except (ValueError, ObjectDoesNotExist) as exc:
+                logger.exception("single_notification: recipient not found: %s", recipient)
+                return False, 0
+        else:
+            recipient_user = recipient
+
+        # Defer the DB write until after surrounding transaction commits
+        def _create():
+            try:
+                Notification.objects.create(
+                    recipient=recipient_user,
+                    type=type,
+                    title=(title or "")[:50],
+                    message=message or "",
+                    meta=meta_value,
+                    read=False,
+                )
+                return True
+            except Exception:
+                logger.exception("single_notification: failed to create notification for user %s", getattr(recipient_user, "id", None))
+                return False
+
+        # If called inside a transaction ensure creation runs after commit
+        try:
+            transaction.on_commit(_create)
+            # We optimistically return True here because creation is scheduled.
+            # If you need synchronous confirmation, call _create() directly (but it's safer to defer).
+            return True, 1
+        except Exception:
+            # fallback: try immediate creation (best-effort)
+            ok = _create()
+            return (True, 1) if ok else (False, 0)
+
+    except Exception as exc:
+        logger.exception("single_notification: unexpected error: %s", exc)
+        return False, 0
+  
+
 def create_notification(
     task: Optional[Task] = None,
     title: str = "",

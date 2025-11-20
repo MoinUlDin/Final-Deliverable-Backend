@@ -22,7 +22,7 @@ from datetime import timedelta
 from rest_framework.exceptions import ValidationError, PermissionDenied
 from .serializers import (
     RegistrationSerializer, CompactTaskSerializer,
-    LoginSerializer, TaskSerializer, 
+    LoginSerializer, TaskSerializer, ProfileSerializer,
     ChangePasswordSerializer, NotificationSerializer,
     PasswordResetRequestSerializer,
     PasswordResetConfirmSerializer,
@@ -67,7 +67,42 @@ class RegisterView(APIView):
 
         return Response({"detail": "Registration successful. Awaiting admin approval."}, status=status.HTTP_201_CREATED)
 
+class ProfileView(APIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = ProfileSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    
+    def get(self, request, *args, **kwargs):
+        user = request.user
+        serializer = ProfileSerializer(user, context={'request': request})
+        
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    def patch(self, request, *args, **kwargs):
+        """
+        Partial update for profile fields and picture.
+        Allowed to update: first_name, last_name, picture.
+        Disallowed (will be ignored if provided): username, email, employee_number, department, role, is_approved, is_rejected
+        """
+        user = request.user
 
+        # copy incoming data and remove disallowed keys (defensive)
+        incoming = request.data.copy() if hasattr(request, "data") else {}
+        forbidden = {"username", "email", "employee_number", "department", "role", "is_approved", "is_rejected"}
+        for k in list(incoming.keys()):
+            if k in forbidden:
+                incoming.pop(k, None)
+
+        # Use serializer for validation/save (partial update)
+        serializer = ProfileSerializer(user, data=incoming, partial=True, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+
+        # Save inside a transaction to be safe (especially with file uploads)
+        with transaction.atomic():
+            serializer.save()
+
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
 class AdminApprovalView(APIView):
     """
     Admin-only: approve or reject a pending registration.
@@ -75,7 +110,6 @@ class AdminApprovalView(APIView):
     POST payload examples:
     { "user_id": 5, "action": "approve" }   # or "reject"
     """
-    permission_classes = [IsAuthenticated] 
     permission_classes = [IsAuthenticated, RolePermission]
     serializer_class = AdminApprovalSerializer
     def post(self, request):
@@ -368,36 +402,79 @@ class TaskViewSet(viewsets.ModelViewSet):
     def assign(self, request, pk=None):
         """
         Assign members to an existing task (manager/admin action).
-        Body: { "assignees": [1,2,3] }
+        Accepts body: { "assignees": [1,2,3] }
+        Behaviour:
+          - Add new assignments for ids present in payload but not currently assigned.
+          - Remove assignments for ids currently assigned but not present in payload.
+          - Return { "detail": "...", "added": [...], "removed": [...] }
         """
         user = request.user
         if getattr(user, "role", None) not in (user.Roles.MANAGER, user.Roles.ADMIN):
             raise PermissionDenied("Only Managers or Admins can assign tasks.")
 
         task = self.get_object()
+
         assignees = request.data.get("assignees", [])
+
         if not isinstance(assignees, (list, tuple)):
             raise ValidationError({"assignees": "assignees must be a list of user ids."})
 
-        created = []
+        # Normalize & validate incoming ids (all must be integers)
+        new_ids = set()
         for uid in assignees:
             try:
-                uid_int = int(uid)
+                new_ids.add(int(uid))
             except Exception:
                 raise ValidationError({"assignees": f"Invalid user id: {uid}"})
-            try:
-                target = User.objects.get(pk=uid_int)
-            except User.DoesNotExist:
-                raise ValidationError({"assignees": f"User id {uid_int} not found."})
 
-            if target.role != User.Roles.MEMBER:
-                raise ValidationError({"assignees": f"User {target.username} is not a Member and cannot be assigned."})
+        # Current assigned user ids for this task
+        current_qs = Assignment.objects.filter(task=task).values_list("user_id", flat=True)
+        current_ids = set(int(x) for x in current_qs)
 
-            obj, created_flag = Assignment.objects.get_or_create(task=task, user=target, defaults={"assigned_by": user})
-            if created_flag:
-                created.append(target.id)
+        to_add = new_ids - current_ids
+        to_remove = current_ids - new_ids
 
-        return Response({"detail": "Assigned processed.", "created": created})
+        added = []
+        removed = []
+
+        # Validate all user ids in to_add exist and are Members before making DB changes
+        if to_add:
+            invalid_users = []
+            non_members = []
+            for uid in list(to_add):
+                try:
+                    u = User.objects.get(pk=uid)
+                except User.DoesNotExist:
+                    invalid_users.append(uid)
+                    continue
+                if u.role != User.Roles.MEMBER:
+                    non_members.append(uid)
+
+            if invalid_users:
+                raise ValidationError({"assignees": f"User id(s) not found: {invalid_users}"})
+            if non_members:
+                raise ValidationError({"assignees": f"User id(s) are not members and cannot be assigned: {non_members}"})
+
+        # Now perform DB changes in a transaction
+        with transaction.atomic():
+            # remove assignments no longer present
+            if to_remove:
+                removed_qs = Assignment.objects.filter(task=task, user_id__in=list(to_remove))
+                # collect removed ids for response
+                removed = list(removed_qs.values_list("user_id", flat=True))
+                deleted_count, _ = removed_qs.delete()
+
+            # create new assignments (use get_or_create per user so post_save signals fire)
+            for uid in to_add:
+                target = User.objects.get(pk=uid)  # validated above
+                assignment_obj, created_flag = Assignment.objects.get_or_create(
+                    task=task, user=target, defaults={"assigned_by": user}
+                )
+                if created_flag:
+                    added.append(target.id)
+                
+
+        return Response({"detail": "Assignment update processed.", "added": added, "removed": removed})
 
     @action(detail=True, methods=['post'], url_path='upload-files', url_name='upload_files', parser_classes=[MultiPartParser, FormParser])
     def upload_files(self, request, pk=None):
@@ -606,20 +683,20 @@ class MemberDashboardView(APIView):
             on_time_rate = int(round((on_time_count / completed) * 100))
 
         # Prepare the prioritized 5 tasks
-        desired = 5
+        desired = 10
         selected = []
         selected_ids = set()
 
         # 1) one overdue (if any) - earliest due first
         overdue_qs = base_qs.filter(due_date__lt=now).exclude(status=Task.Status.COMPLETED).order_by('due_date')
         if overdue_qs.exists():
-            t = overdue_qs.first()
-            selected.append(self._compact_task_dict(t, target_user, over_due=True))
-            selected_ids.add(t.id)
+            for t in overdue_qs:
+                selected.append(self._compact_task_dict(t, target_user, over_due=True))
+                selected_ids.add(t.id)
 
         # 2) up to 3 deadline-approaching (next 3 days), excluding already picked
         deadline_qs = base_qs.filter(due_date__gte=now, due_date__lte=window).exclude(status=Task.Status.COMPLETED).exclude(id__in=selected_ids).order_by('due_date')
-        for t in deadline_qs[:3]:
+        for t in deadline_qs[:4]:
             if len(selected) >= desired:
                 break
             selected.append(self._compact_task_dict(t, target_user, dead_line=True))
@@ -651,7 +728,6 @@ class MemberDashboardView(APIView):
         }
 
         return Response(data, status=status.HTTP_200_OK)
-
 
 
 # Notifications

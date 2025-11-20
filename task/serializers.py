@@ -53,6 +53,15 @@ class RegistrationSerializer(serializers.ModelSerializer):
         user.save()
         return user
 
+class ProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = [
+            "first_name", "last_name", "username",
+            "role", 'is_approved','is_rejected',  
+            "employee_number", "department", "picture",
+            "email",
+        ]
 
 class LoginSerializer(TokenObtainPairSerializer):
     """

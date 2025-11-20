@@ -166,11 +166,13 @@ def notify_overdue_tasks():
                     recipient="member",
                     meta={"task_id": str(task.id)},
                     admin=False,
+                    
                 )
 
                 # mark task as notified
                 task.is_notified = True
-                task.save(update_fields=["is_notified"])
+                task.status = Task.Status.OVERDUE
+                task.save(update_fields=["is_notified", 'status'])
 
                 logger.info("notify_overdue_tasks: notifications created for task %s", task.id)
 

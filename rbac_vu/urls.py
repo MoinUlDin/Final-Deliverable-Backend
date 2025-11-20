@@ -8,7 +8,7 @@ from rest_framework_simplejwt.views import (
     TokenVerifyView,
 )
 from task.views import (
-    RegisterView, AdminApprovalView, LoginView, MemberDashboardView,
+    RegisterView, AdminApprovalView, LoginView, MemberDashboardView, ProfileView,
     ChangePasswordView, PasswordResetRequestView, PasswordResetConfirmView, PendingRequests
 )
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView, SpectacularRedocView
@@ -17,6 +17,7 @@ urlpatterns = [
      path("auth/register/", RegisterView.as_view(), name="auth-register"),
     path("auth/approve/", AdminApprovalView.as_view(), name="auth-approve"),
     path("auth/login/", LoginView.as_view(), name="token_obtain_pair"),
+    path("auth/profile/", ProfileView.as_view(), name="user-profile"),
     path("auth/pending-requests/", PendingRequests.as_view(), name="pending-requests"),
     path("auth/change-password/", ChangePasswordView.as_view(), name="change-password"),
     path("auth/password-reset/", PasswordResetRequestView.as_view(), name="password-reset-request"),

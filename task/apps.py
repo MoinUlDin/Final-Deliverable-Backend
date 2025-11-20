@@ -11,6 +11,10 @@ class TaskConfig(AppConfig):
     name = 'task'
 
     def ready(self):
+        try:
+            from . import signals  # noqa: F401
+        except Exception:
+            logger.exception("TaskConfig.ready: failed to import signals")
         # Only start scheduler when env var START_SCHEDULER=true (or DEBUG=False and an explicit flag)
         start_flag = os.environ.get("START_SCHEDULER", "false").lower() in ("1", "true", "yes")
         if not start_flag:
