@@ -18,7 +18,9 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
 from django.utils import timezone
-from datetime import timedelta
+from datetime import timedelta, datetime
+from django.db.models.functions import TruncHour, TruncDay, TruncWeek, TruncMonth
+from typing import Tuple, Dict
 from rest_framework.exceptions import ValidationError, PermissionDenied
 from .serializers import (
     RegistrationSerializer, CompactTaskSerializer,
@@ -71,38 +73,52 @@ class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
     serializer_class = ProfileSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
-    
+
     def get(self, request, *args, **kwargs):
         user = request.user
         serializer = ProfileSerializer(user, context={'request': request})
-        
         return Response(serializer.data, status=status.HTTP_200_OK)
-    
+
     def patch(self, request, *args, **kwargs):
-        """
-        Partial update for profile fields and picture.
-        Allowed to update: first_name, last_name, picture.
-        Disallowed (will be ignored if provided): username, email, employee_number, department, role, is_approved, is_rejected
-        """
         user = request.user
 
-        # copy incoming data and remove disallowed keys (defensive)
-        incoming = request.data.copy() if hasattr(request, "data") else {}
-        forbidden = {"username", "email", "employee_number", "department", "role", "is_approved", "is_rejected"}
+        # 1. Build a SAFE incoming dict (shallow copy, skip files)
+        incoming = {}
+        for key, value in request.data.items():
+            if key in request.FILES:
+                continue  # file fields handled separately
+            incoming[key] = value
+
+        # 2. Remove forbidden fields
+        forbidden = {
+            "username", "email", "employee_number", "department",
+            "role", "is_approved", "is_rejected"
+        }
         for k in list(incoming.keys()):
             if k in forbidden:
                 incoming.pop(k, None)
 
-        # Use serializer for validation/save (partial update)
-        serializer = ProfileSerializer(user, data=incoming, partial=True, context={"request": request})
+        # 3. Validate + save non-file fields
+        serializer = ProfileSerializer(
+            user,
+            data=incoming,
+            partial=True,
+            context={"request": request}
+        )
         serializer.is_valid(raise_exception=True)
 
-        # Save inside a transaction to be safe (especially with file uploads)
+        picture = request.FILES.get("picture")
+
         with transaction.atomic():
             serializer.save()
 
+            # 4. Save file separately (no deepcopy issues)
+            if picture:
+                user.picture = picture
+                user.save(update_fields=["picture"])
+
         return Response(serializer.data, status=status.HTTP_200_OK)
-    
+
 class AdminApprovalView(APIView):
     """
     Admin-only: approve or reject a pending registration.
@@ -856,3 +872,187 @@ class NotificationViewSet(mixins.ListModelMixin,
         qs = Notification.objects.filter(recipient=request.user, read=False)
         updated = qs.update(read=True)
         return Response({"status": "ok", "updated": updated})
+
+# ---------------------------------------------------
+# ---------------------------------------------------
+# ---------------------------------------------------
+
+
+
+# helper: map granularity -> trunc function and name
+TRUNC_MAP = {
+    "hour": (TruncHour, "hour"),
+    "day":  (TruncDay,  "day"),
+    "week": (TruncWeek, "week"),
+    "month":(TruncMonth,"month"),
+}
+
+
+def parse_date_param(s: str):
+    """
+    Accepts ISO date strings or simple YYYY-MM-DD and returns
+    an aware datetime (start of day) in project timezone.
+    """
+    if not s:
+        return None
+    try:
+        # try ISO first
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d")
+        except Exception:
+            return None
+    if timezone.is_naive(dt):
+        # assume settings.TIME_ZONE, make aware
+        return timezone.make_aware(dt)
+    return dt
+
+
+class TaskStatisticsView(APIView):
+    """
+    GET /api/stats/tasks/?start_date=2025-01-01&end_date=2025-01-31&granularity=day
+
+    - Admins: see overall stats
+    - Managers: see tasks where they are creator OR assigned_by in assignments
+    - Other roles: 403
+    """
+    permission_classes = [IsAuthenticated, RolePermission]
+    allowed_roles = [User.Roles.ADMIN, User.Roles.MANAGER]
+
+    def get_task_base_qs(self, request_user):
+        """
+        Return base Task queryset depending on role.
+        Admin -> all tasks
+        Manager -> tasks created by this manager OR tasks with assignments assigned_by=this manager
+        """
+        if getattr(request_user, "role", None) == User.Roles.ADMIN:
+            return Task.objects.all()
+        # manager:
+        return Task.objects.filter(
+            Q(created_by=request_user) |
+            Q(assignments__assigned_by=request_user)
+        ).distinct()
+
+    def aggregate_series(self, qs, trunc_func, trunc_name, start_dt, end_dt) -> Dict:
+        """
+        Create two series:
+         - created_series: group by trunc(created_at)
+         - completed_series: group by trunc(completed_at)
+        Return dictionaries keyed by period (ISO date) with metrics.
+        """
+        out = {}
+
+        # Created grouping
+        created_qs = qs
+        if start_dt:
+            created_qs = created_qs.filter(created_at__gte=start_dt)
+        if end_dt:
+            created_qs = created_qs.filter(created_at__lte=end_dt)
+
+        created_agg = (
+            created_qs
+            .annotate(period=trunc_func('created_at'))
+            .values('period')
+            .annotate(tasks_created=Count('id'), avg_progress=Avg('progress'))
+            .order_by('period')
+        )
+
+        for r in created_agg:
+            p = r['period'].isoformat() if r['period'] is not None else None
+            out.setdefault(p, {"period": p, "tasks_created": 0, "tasks_completed": 0, "avg_progress": None})
+            out[p]["tasks_created"] = r['tasks_created']
+            # avg progress from created window
+            out[p]["avg_progress"] = float(round(r['avg_progress'] or 0, 2))
+
+        # Completed grouping (note: completed_at may be null)
+        completed_qs = qs.exclude(completed_at__isnull=True)
+        if start_dt:
+            completed_qs = completed_qs.filter(completed_at__gte=start_dt)
+        if end_dt:
+            completed_qs = completed_qs.filter(completed_at__lte=end_dt)
+
+        completed_agg = (
+            completed_qs
+            .annotate(period=trunc_func('completed_at'))
+            .values('period')
+            .annotate(tasks_completed=Count('id'))
+            .order_by('period')
+        )
+
+        for r in completed_agg:
+            p = r['period'].isoformat() if r['period'] is not None else None
+            out.setdefault(p, {"period": p, "tasks_created": 0, "tasks_completed": 0, "avg_progress": None})
+            out[p]["tasks_completed"] = r['tasks_completed']
+
+        # Convert to list sorted by period (None last)
+        items = list(out.values())
+        items.sort(key=lambda it: (it['period'] is None, it['period']))
+        return items
+
+    def get(self, request, *args, **kwargs):
+        # parse query params
+        start_raw = request.query_params.get('start_date')
+        end_raw = request.query_params.get('end_date')
+        granularity = request.query_params.get('granularity', 'day').lower()
+        if granularity not in TRUNC_MAP:
+            granularity = 'day'
+
+        start_dt = parse_date_param(start_raw)
+        end_dt = parse_date_param(end_raw)
+
+        trunc_func, trunc_name = TRUNC_MAP[granularity]
+
+        # base queryset depending on role
+        base_qs = self.get_task_base_qs(request.user)
+
+        # apply timeframe to top-level stats (we'll compute main counts inside time window if provided)
+        if start_dt:
+            base_qs_filtered = base_qs.filter(created_at__gte=start_dt)
+        else:
+            base_qs_filtered = base_qs
+        if end_dt:
+            base_qs_filtered = base_qs_filtered.filter(created_at__lte=end_dt)
+
+        # top-level stats within the timeframe (created in range)
+        total_tasks = base_qs_filtered.count()
+        completed_count = base_qs_filtered.filter(status=Task.Status.COMPLETED).count()
+        overdue_count = base_qs_filtered.filter(due_date__lt=timezone.now()).exclude(status=Task.Status.COMPLETED).count()
+        avg_progress = base_qs_filtered.aggregate(avg=Avg('progress'))['avg'] or 0.0
+        avg_progress = float(round(avg_progress, 2))
+
+        # breakdowns
+        by_status_qs = base_qs_filtered.values('status').annotate(count=Count('id'))
+        by_status = {r['status']: r['count'] for r in by_status_qs}
+
+        by_priority_qs = base_qs_filtered.values('priority').annotate(count=Count('id'))
+        by_priority = {r['priority']: r['count'] for r in by_priority_qs}
+
+        # time series
+        series = self.aggregate_series(base_qs, trunc_func, trunc_name, start_dt, end_dt)
+
+        # OPTIONAL: return a sample image url (developer note: we will transform local path to url)
+        sample_chart_url = "/mnt/data/8e74240e-5478-4c5f-8131-1966cd51f7ed.png"
+
+        payload = {
+            "meta": {
+                "start_date": start_dt.isoformat() if start_dt else None,
+                "end_date": end_dt.isoformat() if end_dt else None,
+                "granularity": granularity,
+                "role": request.user.role,
+            },
+            "stats": {
+                "total_tasks": total_tasks,
+                "completed": completed_count,
+                "overdue": overdue_count,
+                "avg_progress": avg_progress,
+            },
+            "breakdowns": {
+                "by_status": by_status,
+                "by_priority": by_priority,
+            },
+            "series": series,  # list of { period, tasks_created, tasks_completed, avg_progress }
+            "sample_chart_image": sample_chart_url,
+        }
+
+        return Response(payload, status=status.HTTP_200_OK)

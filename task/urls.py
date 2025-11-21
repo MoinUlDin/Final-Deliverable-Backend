@@ -2,7 +2,8 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
-    TaskViewSet,RemoveAttachedFile, ListMembers, NotificationViewSet
+    TaskViewSet,RemoveAttachedFile, ListMembers, NotificationViewSet,
+    TaskStatisticsView
 )
 
 router = DefaultRouter()
@@ -12,5 +13,6 @@ router.register('', TaskViewSet, basename='task')
 urlpatterns = [
     path("list-members/", ListMembers.as_view(), name='list-members'),
     path("remove-file/<uuid:pk>/", RemoveAttachedFile.as_view(), name='remove-file'),
+    path("statistics/", TaskStatisticsView.as_view(), name="task-statistics"),
     path("", include(router.urls)),
 ]
