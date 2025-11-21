@@ -9,7 +9,8 @@ from rest_framework_simplejwt.views import (
 )
 from task.views import (
     RegisterView, AdminApprovalView, LoginView, MemberDashboardView, ProfileView,
-    ChangePasswordView, PasswordResetRequestView, PasswordResetConfirmView, PendingRequests
+    ChangePasswordView, PasswordResetRequestView, PasswordResetConfirmView, 
+    PendingRequests, AdminDashboardView
 )
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView, SpectacularRedocView
 urlpatterns = [
@@ -27,6 +28,8 @@ urlpatterns = [
     path('api/token/verify/', TokenVerifyView.as_view(), name='token_verify'),
 
     # Dashboard
+    
+    path('dashbord/admin/', AdminDashboardView.as_view(), name='dashboard-admin'),
     path('dashbord/member/<user_id>/', MemberDashboardView.as_view(), name='dashboard-member'),
     
     

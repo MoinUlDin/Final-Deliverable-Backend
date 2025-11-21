@@ -58,7 +58,7 @@ class ProfileSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             "first_name", "last_name", "username",
-            "role", 'is_approved','is_rejected',  
+            "role",'is_active', 'is_approved','is_rejected',  
             "employee_number", "department", "picture",
             "email",
         ]

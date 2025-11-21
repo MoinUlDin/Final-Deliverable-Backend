@@ -9,7 +9,7 @@ from django.conf import settings
 from drf_spectacular.utils import extend_schema
 from rest_framework import viewsets, status, mixins
 from rest_framework.decorators import action
-from django.db.models import Avg, F
+from django.db.models import Avg, F, Count, Q
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -168,7 +168,7 @@ class ChangePasswordView(APIView):
         op = serializer.validated_data["old_password"]
 
         if not user.check_password(op):
-            return Response({"old_password": ["Wrong password."]}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"old_password": ["Old password is not correct."]}, status=status.HTTP_400_BAD_REQUEST)
 
         user.set_password(np)
         user.save()
@@ -624,7 +624,9 @@ class ListMembers(APIView):
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-
+# ===========================================================================
+# ============================= Dashboards ==================================
+# ===========================================================================
 class MemberDashboardView(APIView):
     permission_classes = [IsAuthenticated, RolePermission]
     allowed_roles = [User.Roles.ADMIN, User.Roles.MANAGER, User.Roles.MEMBER]
@@ -729,6 +731,73 @@ class MemberDashboardView(APIView):
 
         return Response(data, status=status.HTTP_200_OK)
 
+class AdminDashboardView(APIView):
+    permission_classes = [IsAuthenticated, RolePermission]
+    allowed_roles = [User.Roles.ADMIN]
+
+    def get(self, request, *args, **kwargs):
+        # Base sets
+        users_qs = User.objects.all()
+        total_users = users_qs.count()
+        active_count = users_qs.filter(is_active=True).count()
+        managers_count = users_qs.filter(role=User.Roles.MANAGER).count()
+        members_count = users_qs.filter(role=User.Roles.MEMBER).count()
+
+        tasks_qs = Task.objects.all()
+        total_tasks = tasks_qs.count()
+        completed_count = tasks_qs.filter(status=Task.Status.COMPLETED).count()
+
+        performance_all = int(round((completed_count / total_tasks) * 100)) if total_tasks > 0 else 0
+
+        # Annotate users with counts: total assigned tasks, completed assigned tasks
+        annotated_qs = users_qs.annotate(
+            total_assigned=Count("assignments__task", distinct=True),
+            completed_assigned=Count(
+                "assignments__task",
+                filter=Q(assignments__task__status=Task.Status.COMPLETED),
+                distinct=True,
+            ),
+        ).order_by("-total_assigned", "username")
+
+        users_data = []
+        for user in annotated_qs:
+            # serialize base profile fields
+            serializer = ProfileSerializer(user, context={"request": request})
+            user_data = serializer.data
+
+            # annotated counts (may be None)
+            total_assigned = int(getattr(user, "total_assigned", 0) or 0)
+            completed_assigned = int(getattr(user, "completed_assigned", 0) or 0)
+
+            # per-user performance %
+            if total_assigned > 0:
+                perf = int(round((completed_assigned / total_assigned) * 100))
+            else:
+                perf = 0
+
+            # Append additional stats
+            user_data.update({
+                "total_tasks_assigned": total_assigned,
+                "completed_tasks_assigned": completed_assigned,
+                "performance": perf, 
+            })
+
+            users_data.append(user_data)
+
+        payload = {
+            "stats": {
+                "total_users": total_users,
+                "managers": managers_count,
+                "members": members_count,
+                "active": active_count,
+                "total_tasks": total_tasks,
+                "completed_count": completed_count,
+                "performance": performance_all,
+            },
+            "users": users_data,
+        }
+
+        return Response(payload, status=status.HTTP_200_OK)
 
 # Notifications
 class NotificationViewSet(mixins.ListModelMixin,
