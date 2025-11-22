@@ -6,7 +6,7 @@ from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from django.utils import timezone
 from django.db import transaction
-from .models import Task, Assignment, TaskFile, Notification
+from .models import Task, Assignment, TaskFile, Notification, Comment
 
 User = get_user_model()
 
@@ -331,4 +331,74 @@ class NotificationSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at"]
 
 
+class CommentSerializer(serializers.ModelSerializer):
+    # returned read-only compact author info
+    created_by = serializers.SerializerMethodField(read_only=True)
+    edited_at = serializers.DateTimeField(read_only=True)
+    created_at = serializers.DateTimeField(read_only=True)
 
+    class Meta:
+        model = Comment
+        fields = [
+            "id",
+            "task",
+            "parent",
+            "text",
+            "created_by",
+            "created_at",
+            "edited_at",
+            "is_deleted",
+            "meta",
+        ]
+        read_only_fields = ["id", "created_by", "created_at", "edited_at", "is_deleted"]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        user = request.user
+        author = instance.created_by
+        if user.id == author.id:
+            data['self'] = True
+        else:
+            data['self'] = False
+        
+        parent = instance.parent
+        if parent:
+            data['parent'] = {
+                "id": parent.id,
+                'text': parent.text,
+                "created_by": self.get_created_by(instance),
+                "created_at": parent.created_at,
+                "edited_at": parent.edited_at,
+            }
+
+        return data
+    
+    def get_created_by(self, obj):
+        if not obj.created_by:
+            return None
+        u = obj.created_by
+        # compact user info as requested earlier across the app
+        request = self.context.get("request")
+        picture = None
+        if getattr(u, "picture", None):
+            try:
+                picture = request.build_absolute_uri(u.picture.url) if request else u.picture.url
+            except Exception:
+                picture = getattr(u, "picture", None)
+        return {
+            "id": u.id,
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+            "username": u.username,
+            "profile_picture": picture,
+            "role": u.role,
+            "email": u.email,
+        }
+
+    def validate(self, attrs):
+        # basic sanity: text must not be empty
+        txt = attrs.get("text", "")
+        if not txt or not str(txt).strip():
+            raise serializers.ValidationError({"text": "Comment text cannot be empty."})
+        return attrs

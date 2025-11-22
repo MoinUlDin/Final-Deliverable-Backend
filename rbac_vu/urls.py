@@ -1,6 +1,7 @@
 from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
+from rest_framework.routers import DefaultRouter
 from django.conf.urls.static import static
 from rest_framework_simplejwt.views import (
     TokenObtainPairView,
@@ -10,9 +11,13 @@ from rest_framework_simplejwt.views import (
 from task.views import (
     RegisterView, AdminApprovalView, LoginView, MemberDashboardView, ProfileView,
     ChangePasswordView, PasswordResetRequestView, PasswordResetConfirmView, 
-    PendingRequests, AdminDashboardView
+    PendingRequests, AdminDashboardView, CommentViewSet
 )
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView, SpectacularRedocView
+
+router = DefaultRouter()
+router.register(r"", CommentViewSet, basename="comment")
+
 urlpatterns = [
      # JWT auth endpoints
      path("auth/register/", RegisterView.as_view(), name="auth-register"),
@@ -40,6 +45,7 @@ urlpatterns = [
     
     path('tasks/', include('task.urls')),
     path('admin/', admin.site.urls),
+    path("comments/", include(router.urls)),
 ]
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

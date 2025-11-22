@@ -171,19 +171,6 @@ class Notification(models.Model):
     class Meta:
         indexes = [models.Index(fields=["recipient", "read"])]
 
-
-class NotificationState(models.Model):
-    """
-    Single-row state store for notification generation.
-    We'll use name='task_notifications' (unique) so it's easy to fetch.
-    """
-    name = models.CharField(max_length=64, unique=True)
-    last_calculation = models.DateField(null=True, blank=True)
-
-    def __str__(self):
-        return f"{self.name}: {self.last_calculation}"
-
-
 class Comment(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     task = models.ForeignKey(Task, on_delete=models.CASCADE, related_name="task_comments")

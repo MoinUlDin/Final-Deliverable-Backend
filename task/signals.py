@@ -5,7 +5,7 @@ from django.dispatch import receiver
 from django.db import transaction
 from django.contrib.auth import get_user_model
 
-from .models import Task, Assignment
+from .models import Task, Assignment, Comment
 from .utils import create_notification, single_notification, format_datetime_friendly
 
 logger = logging.getLogger(__name__)
@@ -91,3 +91,90 @@ def assignment_post_save_notify_assignee(sender, instance: Assignment, created: 
 
     except Exception:
         logger.exception("assignment_post_save_notify_assignee: error for assignment %s", getattr(instance, "id", None))
+
+
+@receiver(post_save, sender=Comment)
+def notify_on_comment(sender, instance: Comment, created, **kwargs):
+    """
+    When a new comment is created:
+      - If it's a reply -> notify parent comment owner (unless author)
+      - Notify task.created_by (if manager/admin and not author)
+      - Notify all Assignment.user (assignees) except author
+      - Notify all Assignment.assigned_by (managers who assigned) except author
+    Deduplicates recipients and never notifies the comment author.
+    """
+    if not created:
+        return
+
+    try:
+        comment = instance
+        task = comment.task
+        author = comment.created_by
+
+        # use set of ints (user ids) to deduplicate
+        recipient_ids = set()
+
+        # 1) Parent owner (reply case)
+        if comment.parent and getattr(comment.parent, "created_by", None):
+            p_owner = comment.parent.created_by
+            if p_owner and p_owner.id != getattr(author, "id", None):
+                recipient_ids.add(p_owner.id)
+
+        # 2) Task creator (if not the author)
+        if getattr(task, "created_by", None) and task.created_by.id != getattr(author, "id", None):
+            recipient_ids.add(task.created_by.id)
+
+        # 3) Assignments — gather assignees and assigned_by
+        assignments = Assignment.objects.filter(task=task).select_related("user", "assigned_by")
+
+        for a in assignments:
+            # assignee (member)
+            if getattr(a, "user", None) and a.user.id != getattr(author, "id", None):
+                recipient_ids.add(a.user.id)
+
+            # assigned_by (manager) — assigned_by may be null
+            if getattr(a, "assigned_by", None) and a.assigned_by.id != getattr(author, "id", None):
+                recipient_ids.add(a.assigned_by.id)
+
+        # final defensive remove of author (in case present)
+        if getattr(author, "id", None) in recipient_ids:
+            recipient_ids.discard(author.id)
+
+        if not recipient_ids:
+            logger.debug("notify_on_comment: no recipients (only author or no participants).")
+            return
+
+        # Build title + message. For recipients we can tailor message for parent-owner vs others.
+        base_title = f"comment on: {task.title}"
+        # Keep message short; frontend can use meta (task_id/comment_id) to show details
+        comment_preview = (comment.text or "")[:180]
+
+        # iterate recipients and send notification
+        for uid in recipient_ids:
+            try:
+                # If this recipient is parent owner, give a more specific message
+                is_parent_owner = bool(comment.parent and comment.parent.created_by and comment.parent.created_by.id == uid)
+                if is_parent_owner:
+                    message = f"@{author.get_full_name() or author.username} replied to your comment on task '{task.title}': \"{comment_preview}\""
+                else:
+                    message = f"@{author.get_full_name() or author.username} commented on task '{task.title}': \"{comment_preview}\""
+
+
+                single_notification(
+                    recipient=uid,
+                    title=base_title,
+                    message=message,
+                    type="Comment",
+                    meta={
+                        "task_id": str(task.id),
+                        "comment_id": str(comment.id),
+                        "parent_id": str(comment.parent.id) if comment.parent else None,
+                    },
+                )
+            except Exception:
+                logger.exception("notify_on_comment: failed to queue notification for user %s", uid)
+
+    except Exception:
+        logger.exception("notify_on_comment: unexpected error")
+
+            

@@ -62,8 +62,12 @@ class CustomUserAdmin(BaseUserAdmin):
         }),
     )
 
+class TaskAdmin(admin.ModelAdmin):
+    list_display = ('title', 'id', )
+    list_filter = ('title', 'id', )
+    ordering = ('title',)
 
 admin.site.register(CustomUser, CustomUserAdmin)
-admin.site.register(Task)
+admin.site.register(Task, TaskAdmin)
 admin.site.register(Assignment)
 admin.site.register(Notification)

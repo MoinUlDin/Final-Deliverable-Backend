@@ -18,7 +18,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
 from django.utils import timezone
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, time
 from django.db.models.functions import TruncHour, TruncDay, TruncWeek, TruncMonth
 from typing import Tuple, Dict
 from rest_framework.exceptions import ValidationError, PermissionDenied
@@ -26,18 +26,19 @@ from .serializers import (
     RegistrationSerializer, CompactTaskSerializer,
     LoginSerializer, TaskSerializer, ProfileSerializer,
     ChangePasswordSerializer, NotificationSerializer,
-    PasswordResetRequestSerializer,
+    PasswordResetRequestSerializer, CommentSerializer,
     PasswordResetConfirmSerializer,
     UserSerializer, AdminApprovalSerializer,
 )
 from .models import (
-    Task, Notification, NotificationState, Comment, 
+    Task, Notification, Comment, 
     TaskFile, Assignment
     )
 from .permissions import RolePermission, IsAdminOrReadOnly,TaskPermission
 
 
 User = get_user_model()
+tz = timezone.get_current_timezone()
 token_generator = PasswordResetTokenGenerator()
 
 
@@ -873,11 +874,9 @@ class NotificationViewSet(mixins.ListModelMixin,
         updated = qs.update(read=True)
         return Response({"status": "ok", "updated": updated})
 
-# ---------------------------------------------------
-# ---------------------------------------------------
-# ---------------------------------------------------
-
-
+# ----------------------------------------------------
+# ------------------ Statistics ----------------------
+# ----------------------------------------------------
 
 # helper: map granularity -> trunc function and name
 TRUNC_MAP = {
@@ -921,18 +920,7 @@ class TaskStatisticsView(APIView):
     allowed_roles = [User.Roles.ADMIN, User.Roles.MANAGER]
 
     def get_task_base_qs(self, request_user):
-        """
-        Return base Task queryset depending on role.
-        Admin -> all tasks
-        Manager -> tasks created by this manager OR tasks with assignments assigned_by=this manager
-        """
-        if getattr(request_user, "role", None) == User.Roles.ADMIN:
-            return Task.objects.all()
-        # manager:
-        return Task.objects.filter(
-            Q(created_by=request_user) |
-            Q(assignments__assigned_by=request_user)
-        ).distinct()
+        return Task.objects.all()
 
     def aggregate_series(self, qs, trunc_func, trunc_name, start_dt, end_dt) -> Dict:
         """
@@ -990,6 +978,16 @@ class TaskStatisticsView(APIView):
         items.sort(key=lambda it: (it['period'] is None, it['period']))
         return items
 
+    def ensure_datetime_plus_one(self, d):
+        
+        if d is None:
+            return None
+        if isinstance(d, datetime):
+            dt = timezone.make_aware(d) if timezone.is_naive(d) else d
+            return dt + timedelta(days=1)
+        # date -> treat as next-day midnight
+        return timezone.make_aware(datetime.combine(d, time.min), tz) + timedelta(days=1) 
+      
     def get(self, request, *args, **kwargs):
         # parse query params
         start_raw = request.query_params.get('start_date')
@@ -1000,6 +998,7 @@ class TaskStatisticsView(APIView):
 
         start_dt = parse_date_param(start_raw)
         end_dt = parse_date_param(end_raw)
+        end_dt = self.ensure_datetime_plus_one(end_dt)
 
         trunc_func, trunc_name = TRUNC_MAP[granularity]
 
@@ -1056,3 +1055,85 @@ class TaskStatisticsView(APIView):
         }
 
         return Response(payload, status=status.HTTP_200_OK)
+
+
+# ------------------------------------------
+# --------------- Comments -----------------
+# ==========================================
+
+
+class CommentViewSet(viewsets.ModelViewSet):
+    """
+    Endpoints:
+    - list: requires ?task_id=<uuid> (returns comments for that task)
+    - retrieve: /comments/<id>/
+    - create: create a comment (task required in payload)
+    - partial_update / update: only author or Admin can update
+    - destroy: only author or Admin can delete
+    """
+    queryset = Comment.objects.select_related("created_by", "task").all().order_by("-created_at")
+    serializer_class = CommentSerializer
+    permission_classes = [IsAuthenticated]
+
+    # list must have task_id query param
+    def get_queryset(self):
+        if self.action == "list":
+            task_id = self.request.query_params.get("task_id")
+            if not task_id:
+                raise ValidationError({"detail": "task_id query parameter is required for listing comments."})
+            qs = Comment.objects.filter(task__id=task_id, is_deleted=False).select_related("created_by").order_by("created_at")
+            return qs
+        return super().get_queryset()
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        task = None
+
+        # ensure task provided (serializer will validate model FK, but we need to inspect)
+        task_obj = serializer.validated_data.get("task")
+        if not task_obj:
+            raise ValidationError({"task": "Task is required to create a comment."})
+        task = task_obj
+
+        # Role-based creation rules:
+        # - Admin & Manager: allowed
+        # - Member: allowed only if assigned to this task
+        role = getattr(user, "role", None)
+        if role == User.Roles.ADMIN or role == User.Roles.MANAGER:
+            # ok
+            pass
+        elif role == User.Roles.MEMBER:
+            # check assignment
+            assigned = Assignment.objects.filter(task=task, user=user).exists()
+            if not assigned:
+                raise PermissionDenied({"detail": "Members can only comment on tasks they are assigned to."})
+        else:
+            raise PermissionDenied({"detail": "Not allowed to create comments."})
+
+        # save with created_by
+        serializer.save(created_by=user)
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        comment = self.get_object()
+
+        # only author or admin can update
+        if comment.created_by_id != user.id and getattr(user, "role", None) != User.Roles.ADMIN:
+            raise PermissionDenied({"detail": "Only the comment author or an Admin can edit this comment."})
+
+        # set edited_at
+        serializer.save(edited_at=timezone.now())
+
+    def destroy(self, request, *args, **kwargs):
+        user = request.user
+        comment = self.get_object()
+
+        # only author or admin can delete
+        if comment.created_by_id != user.id and getattr(user, "role", None) != User.Roles.ADMIN:
+            raise PermissionDenied({"detail": "Only the comment author or an Admin can delete this comment."})
+
+        # Soft-delete: prefer marking is_deleted True so other replies stay consistent.
+        comment.is_deleted = True
+        comment.save(update_fields=["is_deleted"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
